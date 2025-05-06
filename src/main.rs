@@ -1,6 +1,7 @@
 use std::path::{self, Path, PathBuf};
 
 use clap::Parser;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::ThreadPoolBuilder;
 use rayon::prelude::*;
 use std::fs::File;
@@ -30,12 +31,14 @@ fn check_if_directory_exists(dir: &str) -> Result<(), String> {
 fn process_directory_recursively<F>(
     dir: &str,
     process_leaf_entry_fn: F,
+    multi_progress: &MultiProgress,
 ) -> Result<Vec<path::PathBuf>, std::io::Error>
 where
     F: for<'a> Fn(
             &'a str,
             &'a [path::PathBuf],
             &'a [path::PathBuf],
+            &'a MultiProgress,
         ) -> Result<bool, std::io::Error>
         + Send
         + Sync
@@ -51,7 +54,7 @@ where
     let dir_paths: Vec<_> = dirs.iter().map(|e| e.path()).collect();
 
     if dirs.is_empty() {
-        match process_leaf_entry_fn(dir, &file_paths, &dir_paths) {
+        match process_leaf_entry_fn(dir, &file_paths, &dir_paths, &multi_progress) {
             Ok(_) => {
                 return Ok(file_paths);
             }
@@ -67,7 +70,13 @@ where
         .filter_map(|entry| {
             let path = entry.path();
             let process_entry = process_leaf_entry_fn.clone();
-            process_directory_recursively(path.to_str().unwrap(), process_entry).ok()
+            let result = process_directory_recursively(
+                path.to_str().unwrap(),
+                process_entry,
+                multi_progress,
+            )
+            .ok();
+            result
         })
         .flatten()
         .collect();
@@ -87,16 +96,33 @@ fn is_image_file(path: &Path) -> bool {
     }
 }
 
-fn create_zip(output_path: &str, files: &[PathBuf]) -> Result<(), std::io::Error> {
+fn create_zip(
+    output_path: &str,
+    files: &[PathBuf],
+    multi_progress: &MultiProgress,
+) -> Result<(), std::io::Error> {
     // Create a temporary filename by appending .tmp to the output path
     let temp_path = format!("{}.tmp", output_path);
-    println!("Creating temporary zip file at: {}", temp_path);
 
     let file = File::create(&temp_path)?;
     let mut zip = ZipWriter::new(file);
 
     // Use Bzip2 compression for better ratio while maintaining reasonable speed
     let options = FileOptions::<()>::default().compression_method(zip::CompressionMethod::Deflated);
+
+    // Create a progress bar for this directory
+    let pb = multi_progress.add(ProgressBar::new(files.len() as u64));
+    pb.set_style(ProgressStyle::default_bar()
+        .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} files ({eta}) {msg}")
+        .unwrap()
+        .progress_chars("#>-"));
+
+    // Use set_message instead of prefix for inline display
+    let basename = Path::new(output_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(output_path);
+    pb.set_message(format!("Zipping: {}", basename));
 
     for path in files {
         let file_name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
@@ -106,27 +132,27 @@ fn create_zip(output_path: &str, files: &[PathBuf]) -> Result<(), std::io::Error
         zip.start_file(file_name, options)?;
         let mut file = File::open(path)?;
         std::io::copy(&mut file, &mut zip)?;
+        pb.inc(1);
     }
 
     zip.finish()?;
+    pb.finish_and_clear();
 
     // Rename the temporary file to the final output path
-    println!("Renaming to final path: {}", output_path);
     std::fs::rename(temp_path, output_path)?;
 
     Ok(())
 }
 
-fn process_leaf_directory(
+fn compress_images(
     dir: &str,
     files: &[path::PathBuf],
     dirs: &[path::PathBuf],
+    multi_progress: &MultiProgress,
 ) -> Result<bool, std::io::Error> {
     if !dirs.is_empty() {
         return Ok(false);
     }
-
-    println!("Processing directory: {}", dir);
 
     let img_files: Vec<_> = files
         .iter()
@@ -155,15 +181,14 @@ fn process_leaf_directory(
             counter += 1;
         }
 
-        if let Err(e) = create_zip(&zip_path, &files) {
+        if let Err(e) = create_zip(&zip_path, files, multi_progress) {
             eprintln!("Failed to create zip file: {}", e);
             return Err(e);
         }
 
         // After creating the zip file, delete the original directory
-        println!("Deleting directory: {}", dir);
         match std::fs::remove_dir_all(dir) {
-            Ok(_) => println!("Directory deleted successfully"),
+            Ok(_) => (),
             Err(e) => {
                 eprintln!("Failed to delete directory: {}", e);
                 return Err(e);
@@ -188,7 +213,10 @@ fn main() {
         std::process::exit(1);
     }
 
-    match process_directory_recursively(&args.dirname, process_leaf_directory) {
+    // Create a MultiProgress instance to manage multiple progress bars
+    let multi_progress = MultiProgress::new();
+
+    match process_directory_recursively(&args.dirname, compress_images, &multi_progress) {
         Ok(files) => {
             println!("Total files processed: {}", files.len());
 
