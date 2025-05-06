@@ -1,0 +1,10 @@
+[package]
+name = "compress_images"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.5.37", features = ["derive"] }
+indicatif = "0.17.11"
+rayon = "1.10.0"
+zip = "2.6.1"
