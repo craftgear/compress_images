@@ -13,8 +13,10 @@ use zip::write::FileOptions;
 struct Args {
     #[arg(short, long)]
     dirname: String,
-    #[arg(short, long, default_value_t = 4)]
+    #[arg(short, long, default_value_t = 1)]
     num_threads: usize,
+    #[arg(short, long)]
+    mode: Option<String>,
 }
 
 fn check_if_directory_exists(dir: &str) -> Result<(), String> {
@@ -34,12 +36,7 @@ fn process_directory_recursively<F>(
     multi_progress: &MultiProgress,
 ) -> Result<Vec<path::PathBuf>, std::io::Error>
 where
-    F: for<'a> Fn(
-            &'a str,
-            &'a [path::PathBuf],
-            &'a [path::PathBuf],
-            &'a MultiProgress,
-        ) -> Result<bool, std::io::Error>
+    F: for<'a> Fn(&'a str, &'a [path::PathBuf], &'a MultiProgress) -> Result<bool, std::io::Error>
         + Send
         + Sync
         + Clone,
@@ -51,10 +48,9 @@ where
         .partition(|entry| entry.path().is_file());
 
     let file_paths: Vec<_> = files.iter().map(|e| e.path()).collect();
-    let dir_paths: Vec<_> = dirs.iter().map(|e| e.path()).collect();
 
     if dirs.is_empty() {
-        match process_leaf_entry_fn(dir, &file_paths, &dir_paths, &multi_progress) {
+        match process_leaf_entry_fn(dir, &file_paths, multi_progress) {
             Ok(_) => {
                 return Ok(file_paths);
             }
@@ -101,37 +97,35 @@ fn create_zip(
     files: &[PathBuf],
     multi_progress: &MultiProgress,
 ) -> Result<(), std::io::Error> {
-    // Create a temporary filename by appending .tmp to the output path
     let temp_path = format!("{}.tmp", output_path);
 
     let file = File::create(&temp_path)?;
     let mut zip = ZipWriter::new(file);
 
-    // Use Bzip2 compression for better ratio while maintaining reasonable speed
-    let options = FileOptions::<()>::default().compression_method(zip::CompressionMethod::Deflated);
-
-    // Create a progress bar for this directory
     let pb = multi_progress.add(ProgressBar::new(files.len() as u64));
     pb.set_style(ProgressStyle::default_bar()
         .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} files ({eta}) {msg}")
         .unwrap()
         .progress_chars("#>-"));
 
-    // Use set_message instead of prefix for inline display
     let basename = Path::new(output_path)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(output_path);
     pb.set_message(format!("Zipping: {}", basename));
 
+    let options = FileOptions::<()>::default().compression_method(zip::CompressionMethod::Deflated);
+
+    // Write files to zip from memory
+
     for path in files {
         let file_name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid file name")
         })?;
-
         zip.start_file(file_name, options)?;
         let mut file = File::open(path)?;
         std::io::copy(&mut file, &mut zip)?;
+
         pb.inc(1);
     }
 
@@ -147,13 +141,8 @@ fn create_zip(
 fn compress_images(
     dir: &str,
     files: &[path::PathBuf],
-    dirs: &[path::PathBuf],
     multi_progress: &MultiProgress,
 ) -> Result<bool, std::io::Error> {
-    if !dirs.is_empty() {
-        return Ok(false);
-    }
-
     let img_files: Vec<_> = files
         .iter()
         .filter(|path| is_image_file(path))
@@ -199,9 +188,67 @@ fn compress_images(
     Ok(true)
 }
 
+fn clean_dir(
+    dir: &str,
+    files: &[path::PathBuf],
+    _multi_progress: &MultiProgress,
+) -> Result<bool, std::io::Error> {
+    println!("Cleaning directory: {}", dir);
+
+    let mut deleted_count = 0;
+
+    // Check each file and delete if size is zero
+    for file_path in files {
+        // Get file metadata to check size
+        match std::fs::metadata(file_path) {
+            Ok(metadata) => {
+                // Check if file is zero-sized or hidden (starts with a dot)
+                let is_hidden = file_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with('.'));
+
+                if metadata.len() == 0 || is_hidden {
+                    // File size is zero, delete it
+                    if let Err(e) = std::fs::remove_file(file_path) {
+                        eprintln!(
+                            "Failed to delete zero-size file {}: {}",
+                            file_path.display(),
+                            e
+                        );
+                    } else {
+                        deleted_count += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to get metadata for {}: {}", file_path.display(), e);
+            }
+        }
+    }
+
+    println!(
+        " deleted {} zero-size or hidden files, files {}",
+        deleted_count,
+        files.len()
+    );
+
+    if deleted_count == files.len() || files.is_empty() {
+        // If all files were deleted, remove the directory
+        println!("Removing empty directory: {}", dir);
+        if let Err(e) = std::fs::remove_dir_all(dir) {
+            eprintln!("Failed to delete directory {}: {}", dir, e);
+            return Err(e);
+        }
+    }
+
+    Ok(true)
+}
+
 fn main() {
     let args = Args::parse();
     let num_threads = args.num_threads;
+    let mode = args.mode.unwrap_or_else(|| "compress".to_string());
 
     ThreadPoolBuilder::new()
         .num_threads(num_threads)
@@ -216,11 +263,18 @@ fn main() {
     // Create a MultiProgress instance to manage multiple progress bars
     let multi_progress = MultiProgress::new();
 
-    match process_directory_recursively(&args.dirname, compress_images, &multi_progress) {
+    let process_leaf_fn = match mode.as_str() {
+        "compress" => compress_images,
+        "clean" => clean_dir,
+        _ => {
+            eprintln!("Invalid mode: {}. Use 'compress'.", mode);
+            std::process::exit(1);
+        }
+    };
+
+    match process_directory_recursively(&args.dirname, process_leaf_fn, &multi_progress) {
         Ok(files) => {
             println!("Total files processed: {}", files.len());
-
-            println!("Found {} image files", files.len());
         }
         Err(e) => {
             eprintln!("Failed to read directory: {}", e);
